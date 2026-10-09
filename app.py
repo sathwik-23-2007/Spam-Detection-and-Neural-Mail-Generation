@@ -8,16 +8,14 @@ from html import escape
 import nltk
 from nltk.corpus import stopwords
 from dotenv import load_dotenv
-from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask import (
+    Flask,
+    render_template,
+    request,
+    jsonify,
+    send_from_directory,
+)
 from huggingface_hub import InferenceClient
-
-# Optional SHAP import. The explanations below use model coefficients,
-# not actual SHAP values.
-try:
-    import shap
-    SHAP_AVAILABLE = True
-except ImportError:
-    SHAP_AVAILABLE = False
 
 
 # ==================================================
@@ -27,36 +25,52 @@ except ImportError:
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-# HTML and CSS are in the same directory as app.py.
-# Disable Flask's default static route and define a safe one below.
 app = Flask(
     __name__,
     template_folder=str(BASE_DIR),
     static_folder=None,
 )
 
-
-# ==================================================
-# LOAD MODEL AND VECTORIZER
-# ==================================================
-
 MODEL_PATH = BASE_DIR / "spam_model.pkl"
 VECTORIZER_PATH = BASE_DIR / "vectorizer.pkl"
 
-with MODEL_PATH.open("rb") as file:
-    model = pickle.load(file)
 
-with VECTORIZER_PATH.open("rb") as file:
-    vectorizer = pickle.load(file)
+# ==================================================
+# LOAD SPAM MODEL AND VECTORIZER
+# ==================================================
+
+try:
+    with MODEL_PATH.open("rb") as file:
+        model = pickle.load(file)
+
+    with VECTORIZER_PATH.open("rb") as file:
+        vectorizer = pickle.load(file)
+
+except Exception:
+    app.logger.exception("Could not load spam model or vectorizer")
+    raise
 
 
 # ==================================================
-# HUGGING FACE API
+# HUGGING FACE CONFIGURATION
 # ==================================================
 
 api_key = os.getenv("HUGGINGFACE_API_KEY")
 
-hf_client = InferenceClient(api_key=api_key) if api_key else None
+# Can be overridden in Vercel environment variables.
+HF_MODEL = os.getenv(
+    "HF_MODEL",
+    "Qwen/Qwen2.5-72B-Instruct",
+)
+
+hf_client = (
+    InferenceClient(
+        provider="auto",
+        api_key=api_key,
+    )
+    if api_key
+    else None
+)
 
 
 # ==================================================
@@ -68,12 +82,11 @@ def serve_static(filename):
     allowed_extensions = {
         ".css", ".png", ".jpg", ".jpeg",
         ".gif", ".svg", ".webp", ".ico",
-        ".woff", ".woff2", ".ttf"
+        ".woff", ".woff2", ".ttf",
     }
 
     requested_path = Path(filename)
 
-    # Only serve root-level public assets, never Python/model/env files.
     if (
         requested_path.name != filename
         or requested_path.suffix.lower() not in allowed_extensions
@@ -98,27 +111,31 @@ NLTK_DATA_DIR = "/tmp/nltk_data"
 if NLTK_DATA_DIR not in nltk.data.path:
     nltk.data.path.append(NLTK_DATA_DIR)
 
-try:
-    stopwords.words("english")
-except LookupError:
-    try:
-        os.makedirs(NLTK_DATA_DIR, exist_ok=True)
-        nltk.download(
-            "stopwords",
-            download_dir=NLTK_DATA_DIR,
-            quiet=True
-        )
-    except Exception:
-        app.logger.exception("Could not download NLTK stopwords")
-
 
 def get_stop_words():
     try:
         return set(stopwords.words("english"))
+
     except LookupError:
-        app.logger.warning(
-            "NLTK stopwords unavailable; proceeding without stopword removal"
-        )
+        try:
+            os.makedirs(NLTK_DATA_DIR, exist_ok=True)
+
+            downloaded = nltk.download(
+                "stopwords",
+                download_dir=NLTK_DATA_DIR,
+                quiet=True,
+                raise_on_error=True,
+            )
+
+            if downloaded:
+                return set(stopwords.words("english"))
+
+        except Exception:
+            app.logger.exception(
+                "Could not load or download NLTK stopwords"
+            )
+
+        # Keep the application usable if stopwords are unavailable.
         return set()
 
 
@@ -130,14 +147,16 @@ def preprocess_text(text):
     text = text.lower()
 
     text = "".join(
-        char for char in text
+        char
+        for char in text
         if char not in string.punctuation
     )
 
     stop_words = get_stop_words()
 
     return " ".join(
-        word for word in text.split()
+        word
+        for word in text.split()
         if word not in stop_words
     )
 
@@ -146,7 +165,8 @@ def get_nlp_summary(text):
     text_lower = text.lower()
 
     text_no_punct = "".join(
-        char for char in text_lower
+        char
+        for char in text_lower
         if char not in string.punctuation
     )
 
@@ -160,12 +180,13 @@ def get_nlp_summary(text):
     return {
         "original_length": len(text),
         "tokens_count": len(words),
-        "stopwords_removed": removed_count
+        "stopwords_removed": removed_count,
     }
 
 
 # ==================================================
 # WORD EXPLANATION HELPERS
+# These are coefficient-based explanations, not SHAP.
 # ==================================================
 
 SPAM_WORD_REASONS = {
@@ -195,20 +216,20 @@ SPAM_WORD_REASONS = {
     "purchase": "promotes a purchase",
     "shop": "promotes a purchase",
 
-    "urgent": "uses urgency or pressure to encourage quick action",
-    "immediately": "uses urgency or pressure to encourage quick action",
-    "hurry": "uses urgency or pressure to encourage quick action",
-    "limited": "uses urgency or pressure to encourage quick action",
-    "expire": "uses urgency or pressure to encourage quick action",
-    "deadline": "uses urgency or pressure to encourage quick action",
-    "now": "uses urgency or pressure to encourage quick action",
-    "today": "uses urgency or pressure to encourage quick action",
+    "urgent": "uses urgency or pressure",
+    "immediately": "uses urgency or pressure",
+    "hurry": "uses urgency or pressure",
+    "limited": "uses urgency or pressure",
+    "expire": "uses urgency or pressure",
+    "deadline": "uses urgency or pressure",
+    "now": "uses urgency or pressure",
+    "today": "uses urgency or pressure",
 
-    "click": "refers to clicking a link or opening content",
-    "link": "refers to clicking a link or opening content",
-    "url": "refers to clicking a link or opening content",
-    "website": "refers to clicking a link or opening content",
-    "download": "refers to clicking a link or opening content",
+    "click": "refers to clicking a link",
+    "link": "refers to clicking a link",
+    "url": "refers to clicking a link",
+    "website": "refers to clicking a link",
+    "download": "refers to downloading content",
 
     "verify": "may relate to account or security requests",
     "confirm": "may relate to account or security requests",
@@ -225,10 +246,10 @@ SPAM_WORD_REASONS = {
     "payment": "refers to banking or payment details",
     "invoice": "refers to banking or payment details",
 
-    "subscribe": "is associated with bulk marketing or promotions",
-    "newsletter": "is associated with bulk marketing or promotions",
-    "promotion": "is associated with bulk marketing or promotions",
-    "marketing": "is associated with bulk marketing or promotions",
+    "subscribe": "is associated with marketing",
+    "newsletter": "is associated with marketing",
+    "promotion": "is associated with marketing",
+    "marketing": "is associated with marketing",
 
     "guarantee": "may be used in promotional promises",
     "refund": "may be used in promotional promises",
@@ -247,16 +268,16 @@ SPAM_WORD_REASONS = {
 
 
 HAM_WORD_REASONS = {
-    "thanks": "is often used in polite, everyday conversation",
-    "thank": "is often used in polite, everyday conversation",
-    "please": "is often used in polite, everyday conversation",
-    "regards": "is often used in polite, everyday conversation",
-    "hello": "is often used in polite, everyday conversation",
-    "hi": "is often used in polite, everyday conversation",
-    "welcome": "is often used in polite, everyday conversation",
+    "thanks": "is often used in polite conversation",
+    "thank": "is often used in polite conversation",
+    "please": "is often used in polite conversation",
+    "regards": "is often used in polite conversation",
+    "hello": "is often used in everyday conversation",
+    "hi": "is often used in everyday conversation",
+    "welcome": "is often used in everyday conversation",
 
-    "good": "is common in ordinary conversational language",
-    "great": "is common in ordinary conversational language",
+    "good": "is common in ordinary conversation",
+    "great": "is common in ordinary conversation",
     "meeting": "is often used in work-related communication",
     "schedule": "is often used in work-related communication",
     "project": "is often used in work-related communication",
@@ -269,10 +290,10 @@ HAM_WORD_REASONS = {
     "office": "refers to workplace communication",
     "company": "refers to workplace communication",
 
-    "discuss": "is used in ordinary discussions and exchanges",
-    "conversation": "is used in ordinary discussions and exchanges",
-    "feedback": "is used in ordinary discussions and exchanges",
-    "question": "is used in ordinary discussions and exchanges",
+    "discuss": "is used in ordinary discussions",
+    "conversation": "is used in ordinary discussions",
+    "feedback": "is used in ordinary discussions",
+    "question": "is used in ordinary discussions",
 
     "home": "is often used in personal communication",
     "family": "is often used in personal communication",
@@ -296,26 +317,26 @@ HAM_WORD_REASONS = {
     "help": "is a common action word",
     "work": "is a common action word",
     "start": "is a common action word",
-    "school": "is related to education or learning",
-    "student": "is related to education or learning",
-    "study": "is related to education or learning",
-    "course": "is related to education or learning",
-    "college": "is related to education or learning",
-    "exam": "is related to education or learning",
+    "school": "is related to education",
+    "student": "is related to education",
+    "study": "is related to education",
+    "course": "is related to education",
+    "college": "is related to education",
+    "exam": "is related to education",
 }
 
 
 def _get_spam_word_reason(word):
     return SPAM_WORD_REASONS.get(
         word.lower(),
-        "the trained model assigns this word a spam-associated weight"
+        "the trained model assigns this word a spam-associated weight",
     )
 
 
 def _get_ham_word_reason(word):
     return HAM_WORD_REASONS.get(
         word.lower(),
-        "the trained model assigns this word a ham-associated weight"
+        "the trained model assigns this word a ham-associated weight",
     )
 
 
@@ -333,7 +354,8 @@ def _join_words(words):
 
 def generate_explanation(result, feature_contributions):
     word_features = [
-        item for item in feature_contributions
+        item
+        for item in feature_contributions
         if item["word"] != "Base Normalcy (Intercept)"
     ]
 
@@ -365,7 +387,8 @@ def generate_explanation(result, feature_contributions):
 
         if selected_words:
             lines.append(
-                "<br><br><strong>🔍 Words influencing the prediction:</strong>"
+                "<br><br><strong>🔍 Words influencing the prediction:"
+                "</strong>"
             )
 
             for index, (word, _score) in enumerate(
@@ -392,6 +415,7 @@ def generate_explanation(result, feature_contributions):
                 "toward the spam prediction. Consider the full "
                 "message and sender before deciding."
             )
+
         else:
             lines.append(
                 "<br><br><strong>💡 Bottom line:</strong> The model "
@@ -401,7 +425,8 @@ def generate_explanation(result, feature_contributions):
 
     else:
         lines.append(
-            "<strong>✅ This email is classified as HAM (not spam).</strong>"
+            "<strong>✅ This email is classified as HAM (not spam)."
+            "</strong>"
         )
         lines.append(
             "<br><br>The model found words that pushed its prediction "
@@ -413,7 +438,8 @@ def generate_explanation(result, feature_contributions):
 
         if selected_words:
             lines.append(
-                "<br><br><strong>✅ Words influencing the prediction:</strong>"
+                "<br><br><strong>✅ Words influencing the prediction:"
+                "</strong>"
             )
 
             for index, (word, _score) in enumerate(
@@ -440,6 +466,7 @@ def generate_explanation(result, feature_contributions):
                 "toward the non-spam prediction. Be cautious with "
                 "unexpected links and requests for sensitive information."
             )
+
         else:
             lines.append(
                 "<br><br><strong>💡 Bottom line:</strong> The model "
@@ -460,7 +487,7 @@ def home():
 
 
 # ==================================================
-# EMAIL GENERATION
+# EMAIL GENERATION - HUGGING FACE
 # ==================================================
 
 @app.route("/generate_mail", methods=["POST"])
@@ -474,39 +501,69 @@ def generate_mail():
     topic = data.get("topic")
 
     if not isinstance(prompt_type, str) or not prompt_type.strip():
-        return jsonify({"error": "Missing type or topic"}), 400
+        return jsonify({"error": "Email type is required"}), 400
 
     if not isinstance(topic, str) or not topic.strip():
-        return jsonify({"error": "Missing type or topic"}), 400
+        return jsonify({"error": "Email topic is required"}), 400
 
     if hf_client is None:
+        app.logger.error(
+            "HUGGINGFACE_API_KEY is missing from the server environment"
+        )
         return jsonify({
             "error": "Hugging Face API key is not configured on the server."
         }), 500
 
     prompt = (
         f"Write a {prompt_type.strip()} email about {topic.strip()}. "
-        "Return only the email draft."
+        "Return only the email draft. Include a suitable subject line "
+        "when appropriate. Do not invent specific facts or commitments."
     )
 
     try:
         response = hf_client.chat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            model="Qwen/Qwen2.5-72B-Instruct",
+            model=HF_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a professional email-writing assistant. "
+                        "Write clear, natural, context-appropriate emails."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
             max_tokens=500,
+            temperature=0.7,
+        )
+
+        email = response.choices[0].message.content
+
+        if not isinstance(email, str) or not email.strip():
+            app.logger.error(
+                "Hugging Face returned an empty email response"
+            )
+            return jsonify({
+                "error": "The AI provider returned an empty response."
+            }), 502
+
+        return jsonify({"email": email.strip()}), 200
+
+    except Exception as exc:
+        # Log the exception type and traceback on the server.
+        # Never log the API token or send internal details to users.
+        app.logger.exception(
+            "Hugging Face generation failed (%s)",
+            type(exc).__name__,
         )
 
         return jsonify({
-            "email": response.choices[0].message.content or ""
-        })
-
-    except Exception:
-        app.logger.exception("Hugging Face API error")
-
-        return jsonify({
             "error": (
-                "Email generation failed. Verify the Hugging Face API key, "
-                "model availability, and Vercel logs."
+                "Email generation failed. Check the server logs "
+                "for the underlying provider error."
             )
         }), 502
 
@@ -534,14 +591,14 @@ def detect_mail():
         vectorized_text = vectorizer.transform([processed_text])
         prediction = model.predict(vectorized_text)[0]
 
-        # This assumes the model uses 1 = Spam and 0 = Ham.
-        # Confirm these labels match the model's training labels.
+        # Assumes the trained model uses 1 = Spam and 0 = Ham.
+        # Verify this against your model's actual training labels.
         result = "Spam" if prediction == 1 else "Ham"
 
         feature_contributions = []
 
-        # Coefficient-based contributions for Logistic Regression.
-        # These are not SHAP values.
+        # Logistic Regression coefficient-based explanations.
+        # These are NOT actual SHAP values.
         try:
             feature_names = vectorizer.get_feature_names_out()
             coefficients = model.coef_[0]
@@ -549,25 +606,25 @@ def detect_mail():
 
             feature_contributions.append({
                 "word": "Base Normalcy (Intercept)",
-                "contribution": intercept
+                "contribution": intercept,
             })
 
             input_features = vectorized_text.tocoo()
 
             for index, value in zip(
                 input_features.col,
-                input_features.data
+                input_features.data,
             ):
                 feature_contributions.append({
                     "word": str(feature_names[index]),
                     "contribution": float(
                         coefficients[index] * value
-                    )
+                    ),
                 })
 
             feature_contributions.sort(
                 key=lambda item: abs(item["contribution"]),
-                reverse=True
+                reverse=True,
             )
 
         except Exception:
@@ -577,21 +634,23 @@ def detect_mail():
 
         explanation = generate_explanation(
             result,
-            feature_contributions
+            feature_contributions,
         )
 
         return jsonify({
             "result": result,
             "nlp_summary": nlp_summary,
             "contributions": feature_contributions[:20],
-            "explanation": explanation
-        })
+            "explanation": explanation,
+        }), 200
 
     except Exception:
         app.logger.exception("Email detection failed")
 
         return jsonify({
-            "error": "Email detection failed. Check the Vercel function logs."
+            "error": (
+                "Email detection failed. Check the server logs."
+            )
         }), 500
 
 
@@ -600,4 +659,8 @@ def detect_mail():
 # ==================================================
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "5000")),
+        debug=False,
+    )
