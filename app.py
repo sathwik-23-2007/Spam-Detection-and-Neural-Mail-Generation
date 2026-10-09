@@ -657,6 +657,17 @@ def detect_mail():
 # LOCAL DEVELOPMENT
 # ==================================================
 
+@app.route("/debug_hf", methods=["GET"])
+def debug_hf():
+    return jsonify({
+        "hf_key_present": bool(
+            os.getenv("HUGGINGFACE_API_KEY")
+        ),
+        "hf_client_initialized": hf_client is not None,
+        "hf_model": HF_MODEL,
+        "hf_library_loaded": True,
+    })
+
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
