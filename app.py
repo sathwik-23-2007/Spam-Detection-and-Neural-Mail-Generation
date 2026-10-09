@@ -11,78 +11,105 @@ from dotenv import load_dotenv
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from huggingface_hub import InferenceClient
 
+# Optional SHAP import. The explanations below use model coefficients,
+# not actual SHAP values.
 try:
     import shap
     SHAP_AVAILABLE = True
 except ImportError:
     SHAP_AVAILABLE = False
-    print("SHAP not found. Explanations will be disabled.")
 
 
-# --------------------------------------------------
+# ==================================================
 # CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-
 load_dotenv(BASE_DIR / ".env")
 
-# All files are in the same directory as app.py.
+# HTML and CSS are in the same directory as app.py.
+# Disable Flask's default static route and define a safe one below.
 app = Flask(
     __name__,
     template_folder=str(BASE_DIR),
-    static_folder=None
+    static_folder=None,
 )
 
 
-# --------------------------------------------------
-# LOAD TRAINED MODEL AND VECTORIZER
-# --------------------------------------------------
+# ==================================================
+# LOAD MODEL AND VECTORIZER
+# ==================================================
 
 MODEL_PATH = BASE_DIR / "spam_model.pkl"
 VECTORIZER_PATH = BASE_DIR / "vectorizer.pkl"
 
-with MODEL_PATH.open("rb") as f:
-    model = pickle.load(f)
+with MODEL_PATH.open("rb") as file:
+    model = pickle.load(file)
 
-with VECTORIZER_PATH.open("rb") as f:
-    vectorizer = pickle.load(f)
+with VECTORIZER_PATH.open("rb") as file:
+    vectorizer = pickle.load(file)
 
 
-# --------------------------------------------------
-# HUGGING FACE CONFIGURATION
-# --------------------------------------------------
+# ==================================================
+# HUGGING FACE API
+# ==================================================
 
 api_key = os.getenv("HUGGINGFACE_API_KEY")
 
-hf_client = (
-    InferenceClient(api_key=api_key)
-    if api_key
-    else None
-)
+hf_client = InferenceClient(api_key=api_key) if api_key else None
 
 
-# --------------------------------------------------
+# ==================================================
+# STATIC FILES
+# ==================================================
+
+@app.route("/static/<path:filename>", endpoint="static")
+def serve_static(filename):
+    allowed_extensions = {
+        ".css", ".png", ".jpg", ".jpeg",
+        ".gif", ".svg", ".webp", ".ico",
+        ".woff", ".woff2", ".ttf"
+    }
+
+    requested_path = Path(filename)
+
+    # Only serve root-level public assets, never Python/model/env files.
+    if (
+        requested_path.name != filename
+        or requested_path.suffix.lower() not in allowed_extensions
+        or filename.startswith(".")
+    ):
+        return jsonify({"error": "Not found"}), 404
+
+    file_path = BASE_DIR / filename
+
+    if not file_path.is_file():
+        return jsonify({"error": "Not found"}), 404
+
+    return send_from_directory(str(BASE_DIR), filename)
+
+
+# ==================================================
 # NLTK STOPWORDS
-# --------------------------------------------------
+# ==================================================
+
+NLTK_DATA_DIR = "/tmp/nltk_data"
+
+if NLTK_DATA_DIR not in nltk.data.path:
+    nltk.data.path.append(NLTK_DATA_DIR)
 
 try:
     stopwords.words("english")
 except LookupError:
-    nltk_dir = "/tmp/nltk_data"
-    os.makedirs(nltk_dir, exist_ok=True)
-    nltk.data.path.append(nltk_dir)
-
     try:
+        os.makedirs(NLTK_DATA_DIR, exist_ok=True)
         nltk.download(
             "stopwords",
-            download_dir=nltk_dir,
+            download_dir=NLTK_DATA_DIR,
             quiet=True
         )
     except Exception:
-        app.logger.exception(
-            "Could not download NLTK stopwords"
-        )
+        app.logger.exception("Could not download NLTK stopwords")
 
 
 def get_stop_words():
@@ -95,9 +122,9 @@ def get_stop_words():
         return set()
 
 
-# --------------------------------------------------
+# ==================================================
 # TEXT PREPROCESSING
-# --------------------------------------------------
+# ==================================================
 
 def preprocess_text(text):
     text = text.lower()
@@ -126,237 +153,170 @@ def get_nlp_summary(text):
     words = text_no_punct.split()
     stop_words = get_stop_words()
 
-    removed_stopwords = [
-        word for word in words
-        if word in stop_words
-    ]
+    removed_count = sum(
+        1 for word in words if word in stop_words
+    )
 
     return {
         "original_length": len(text),
         "tokens_count": len(words),
-        "stopwords_removed": len(removed_stopwords)
+        "stopwords_removed": removed_count
     }
 
 
-# --------------------------------------------------
-# WORD-LEVEL EXPLANATION HELPERS
-# --------------------------------------------------
+# ==================================================
+# WORD EXPLANATION HELPERS
+# ==================================================
+
+SPAM_WORD_REASONS = {
+    "free": "promises money or rewards",
+    "bonus": "promises money or rewards",
+    "prize": "promises money or rewards",
+    "reward": "promises money or rewards",
+    "cash": "promises money or rewards",
+    "money": "promises money or rewards",
+    "earn": "promises money or rewards",
+    "income": "promises money or rewards",
+    "profit": "promises money or rewards",
+    "million": "promises money or rewards",
+    "jackpot": "promises money or rewards",
+    "lottery": "promises money or rewards",
+    "win": "promises money or rewards",
+    "winner": "promises money or rewards",
+    "payout": "promises money or rewards",
+
+    "offer": "promotes a deal or discount",
+    "deal": "promotes a deal or discount",
+    "discount": "promotes a deal or discount",
+    "sale": "promotes a deal or discount",
+    "cheap": "promotes a deal or discount",
+    "buy": "promotes a purchase",
+    "order": "promotes a purchase",
+    "purchase": "promotes a purchase",
+    "shop": "promotes a purchase",
+
+    "urgent": "uses urgency or pressure to encourage quick action",
+    "immediately": "uses urgency or pressure to encourage quick action",
+    "hurry": "uses urgency or pressure to encourage quick action",
+    "limited": "uses urgency or pressure to encourage quick action",
+    "expire": "uses urgency or pressure to encourage quick action",
+    "deadline": "uses urgency or pressure to encourage quick action",
+    "now": "uses urgency or pressure to encourage quick action",
+    "today": "uses urgency or pressure to encourage quick action",
+
+    "click": "refers to clicking a link or opening content",
+    "link": "refers to clicking a link or opening content",
+    "url": "refers to clicking a link or opening content",
+    "website": "refers to clicking a link or opening content",
+    "download": "refers to clicking a link or opening content",
+
+    "verify": "may relate to account or security requests",
+    "confirm": "may relate to account or security requests",
+    "password": "may relate to account or security requests",
+    "login": "may relate to account or security requests",
+    "account": "may relate to account or security requests",
+    "suspended": "may relate to account or security requests",
+    "locked": "may relate to account or security requests",
+
+    "bank": "refers to banking or payment details",
+    "paypal": "refers to banking or payment details",
+    "credit": "refers to banking or payment details",
+    "debit": "refers to banking or payment details",
+    "payment": "refers to banking or payment details",
+    "invoice": "refers to banking or payment details",
+
+    "subscribe": "is associated with bulk marketing or promotions",
+    "newsletter": "is associated with bulk marketing or promotions",
+    "promotion": "is associated with bulk marketing or promotions",
+    "marketing": "is associated with bulk marketing or promotions",
+
+    "guarantee": "may be used in promotional promises",
+    "refund": "may be used in promotional promises",
+    "congratulations": "uses prize or exclusivity language",
+    "selected": "uses prize or exclusivity language",
+    "exclusive": "uses prize or exclusivity language",
+
+    "personal": "refers to personal information",
+    "information": "refers to personal information",
+    "address": "refers to personal information",
+    "claim": "asks the reader to claim something",
+    "redeem": "asks the reader to claim something",
+    "submit": "asks the reader to submit something",
+    "support": "refers to customer service or support",
+}
+
+
+HAM_WORD_REASONS = {
+    "thanks": "is often used in polite, everyday conversation",
+    "thank": "is often used in polite, everyday conversation",
+    "please": "is often used in polite, everyday conversation",
+    "regards": "is often used in polite, everyday conversation",
+    "hello": "is often used in polite, everyday conversation",
+    "hi": "is often used in polite, everyday conversation",
+    "welcome": "is often used in polite, everyday conversation",
+
+    "good": "is common in ordinary conversational language",
+    "great": "is common in ordinary conversational language",
+    "meeting": "is often used in work-related communication",
+    "schedule": "is often used in work-related communication",
+    "project": "is often used in work-related communication",
+    "report": "is often used in work-related communication",
+    "review": "is often used in work-related communication",
+    "progress": "is often used in work-related communication",
+    "task": "is often used in work-related communication",
+    "team": "refers to workplace communication",
+    "manager": "refers to workplace communication",
+    "office": "refers to workplace communication",
+    "company": "refers to workplace communication",
+
+    "discuss": "is used in ordinary discussions and exchanges",
+    "conversation": "is used in ordinary discussions and exchanges",
+    "feedback": "is used in ordinary discussions and exchanges",
+    "question": "is used in ordinary discussions and exchanges",
+
+    "home": "is often used in personal communication",
+    "family": "is often used in personal communication",
+    "friend": "is often used in personal communication",
+    "friends": "is often used in personal communication",
+    "parents": "is often used in personal communication",
+
+    "time": "is a common time reference",
+    "day": "is a common time reference",
+    "week": "is a common time reference",
+    "tomorrow": "is a common time reference",
+    "morning": "is a common time reference",
+    "weekend": "is a common time reference",
+
+    "think": "is common in everyday messages",
+    "hope": "is common in everyday messages",
+    "want": "is common in everyday messages",
+    "need": "is common in everyday messages",
+    "understand": "is common in everyday messages",
+
+    "help": "is a common action word",
+    "work": "is a common action word",
+    "start": "is a common action word",
+    "school": "is related to education or learning",
+    "student": "is related to education or learning",
+    "study": "is related to education or learning",
+    "course": "is related to education or learning",
+    "college": "is related to education or learning",
+    "exam": "is related to education or learning",
+}
+
 
 def _get_spam_word_reason(word):
-    w = word.lower()
-
-    if w in (
-        "free", "bonus", "prize", "reward", "cash",
-        "money", "dollar", "dollars", "earn", "income",
-        "profit", "million", "billion", "jackpot",
-        "lottery", "win", "winner", "won", "payout"
-    ):
-        return "promises money or rewards"
-
-    if w in (
-        "offer", "deal", "discount", "sale", "cheap",
-        "bargain", "lowest", "price", "cost", "save",
-        "saving", "affordable"
-    ):
-        return "promotes a deal or discount"
-
-    if w in (
-        "buy", "order", "purchase", "shop", "store",
-        "checkout"
-    ):
-        return "promotes a purchase"
-
-    if w in (
-        "urgent", "immediately", "hurry", "rush", "fast",
-        "quick", "limited", "expire", "expires",
-        "expiring", "deadline", "asap", "instant",
-        "now", "today", "act", "action", "dont", "miss",
-        "last", "final", "ending"
-    ):
-        return "uses urgency or pressure to encourage quick action"
-
-    if w in (
-        "click", "link", "url", "visit", "website",
-        "http", "www", "href", "redirect", "browse",
-        "download", "install"
-    ):
-        return "refers to clicking a link or opening content"
-
-    if w in (
-        "verify", "confirm", "validate", "update",
-        "secure", "security", "protect", "protection",
-        "authentication", "password", "login", "signin",
-        "credential", "credentials", "account", "suspend",
-        "suspended", "locked", "unauthorized"
-    ):
-        return "may appear in messages requesting account or security actions"
-
-    if w in (
-        "bank", "paypal", "visa", "mastercard", "credit",
-        "debit", "card", "transaction", "billing",
-        "payment", "pay", "invoice"
-    ):
-        return "refers to banking or payment details"
-
-    if w in (
-        "subscribe", "unsubscribe", "newsletter",
-        "promotion", "promotional", "advertise",
-        "advertisement", "marketing", "campaign", "bulk",
-        "mass", "list", "opt", "optin"
-    ):
-        return "is associated with bulk marketing or promotions"
-
-    if w in (
-        "guarantee", "guaranteed", "promise", "risk",
-        "riskfree", "obligation", "refund", "satisfaction",
-        "certified"
-    ):
-        return "may be used in promotional promises"
-
-    if w in (
-        "congratulations", "congrats", "selected",
-        "chosen", "exclusive", "special", "vip",
-        "member", "membership"
-    ):
-        return "uses prize, selection, or exclusivity language"
-
-    if w in (
-        "pill", "pills", "medication", "pharmacy", "drug",
-        "drugs", "prescription", "viagra", "weight", "diet",
-        "supplement", "health", "cure", "treatment",
-        "doctor", "medical"
-    ):
-        return "appears in health-related promotional content"
-
-    if w in (
-        "call", "contact", "reply", "respond", "send",
-        "forward", "txt", "text", "sms", "mobile",
-        "phone", "number"
-    ):
-        return "requests a response or contact"
-
-    if w in (
-        "information", "info", "personal", "details",
-        "data", "name", "address", "social", "ssn"
-    ):
-        return "refers to personal information"
-
-    if w in (
-        "access", "unlock", "open", "enable", "activate",
-        "registration", "register", "signup", "sign"
-    ):
-        return "refers to activating or signing up for something"
-
-    if w in (
-        "claim", "collect", "redeem", "receive", "apply",
-        "request", "submit", "fill", "form"
-    ):
-        return "asks the reader to claim or submit something"
-
-    if w in (
-        "customer", "service", "support", "team",
-        "representative", "agent", "department",
-        "helpdesk", "admin"
-    ):
-        return "refers to customer service or support"
-
-    return "the trained model assigns this word a spam-associated weight"
+    return SPAM_WORD_REASONS.get(
+        word.lower(),
+        "the trained model assigns this word a spam-associated weight"
+    )
 
 
 def _get_ham_word_reason(word):
-    w = word.lower()
-
-    if w in (
-        "thanks", "thank", "thankyou", "appreciate",
-        "grateful", "gratitude", "cheers", "regards",
-        "sincerely", "kindly", "please", "welcome",
-        "hi", "hello", "hey", "dear", "greetings"
-    ):
-        return "is often used in polite, everyday conversation"
-
-    if w in (
-        "good", "great", "nice", "wonderful", "awesome",
-        "excellent", "amazing", "fantastic", "brilliant",
-        "lovely", "fine", "well"
-    ):
-        return "is common in ordinary conversational language"
-
-    if w in (
-        "meeting", "schedule", "agenda", "project",
-        "report", "review", "update", "status", "progress",
-        "task", "plan", "planning", "deadline", "milestone",
-        "deliverable"
-    ):
-        return "is often used in work-related communication"
-
-    if w in (
-        "team", "colleague", "manager", "boss", "office",
-        "department", "company", "organization",
-        "workplace", "coworker", "staff", "employee"
-    ):
-        return "refers to workplace communication"
-
-    if w in (
-        "discuss", "discussion", "talk", "chat",
-        "conversation", "call", "mention", "share", "idea",
-        "thought", "opinion", "feedback", "suggestion",
-        "input", "question"
-    ):
-        return "is used in ordinary discussions and exchanges"
-
-    if w in (
-        "home", "house", "family", "friend", "friends",
-        "kids", "children", "mom", "dad", "brother",
-        "sister", "wife", "husband", "parents", "baby", "love"
-    ):
-        return "is often used in personal communication"
-
-    if w in (
-        "time", "day", "week", "month", "year", "today",
-        "tomorrow", "yesterday", "morning", "evening",
-        "night", "afternoon", "weekend", "date", "soon", "later"
-    ):
-        return "is a common time reference"
-
-    if w in (
-        "know", "think", "feel", "hope", "wish", "want",
-        "need", "like", "love", "enjoy", "remember",
-        "understand", "believe", "sure", "guess", "maybe",
-        "probably", "actually"
-    ):
-        return "is common in everyday messages"
-
-    if w in (
-        "go", "going", "come", "coming", "get", "got",
-        "make", "made", "take", "look", "see", "try",
-        "give", "help", "work", "working", "done",
-        "start", "back", "keep"
-    ):
-        return "is a common action word"
-
-    if w in (
-        "food", "eat", "dinner", "lunch", "breakfast",
-        "restaurant", "cook", "recipe", "coffee", "drink",
-        "movie", "book", "music", "game", "play", "trip",
-        "travel", "vacation"
-    ):
-        return "is often used when discussing everyday activities"
-
-    if w in (
-        "school", "class", "teacher", "student", "study",
-        "learn", "course", "education", "university",
-        "college", "homework", "exam", "test", "grade", "lecture"
-    ):
-        return "is related to education or learning"
-
-    if w in (
-        "said", "told", "asked", "answer", "replied",
-        "wrote", "sent", "received", "read", "heard",
-        "saw", "found"
-    ):
-        return "is used in ordinary communication or storytelling"
-
-    return "the trained model assigns this word a ham-associated weight"
+    return HAM_WORD_REASONS.get(
+        word.lower(),
+        "the trained model assigns this word a ham-associated weight"
+    )
 
 
 def _join_words(words):
@@ -490,83 +450,54 @@ def generate_explanation(result, feature_contributions):
     return "".join(lines)
 
 
-# --------------------------------------------------
-# ROOT-LEVEL STATIC FILES
-# --------------------------------------------------
-
-@app.route("/<path:filename>")
-def root_assets(filename):
-    allowed_extensions = {
-        ".css", ".js", ".png", ".jpg", ".jpeg",
-        ".gif", ".svg", ".webp", ".ico",
-        ".woff", ".woff2", ".ttf"
-    }
-
-    requested_path = Path(filename)
-
-    # This no-folders setup serves assets from the repository root only.
-    if (
-        requested_path.name != filename
-        or requested_path.suffix.lower() not in allowed_extensions
-    ):
-        return jsonify({"error": "Not found"}), 404
-
-    file_path = BASE_DIR / filename
-
-    if not file_path.is_file():
-        return jsonify({"error": "Not found"}), 404
-
-    return send_from_directory(str(BASE_DIR), filename)
-
-
-# --------------------------------------------------
+# ==================================================
 # HOME PAGE
-# --------------------------------------------------
+# ==================================================
 
 @app.route("/")
 def home():
     return render_template("index.html")
 
 
-# --------------------------------------------------
+# ==================================================
 # EMAIL GENERATION
-# --------------------------------------------------
+# ==================================================
 
 @app.route("/generate_mail", methods=["POST"])
 def generate_mail():
     data = request.get_json(silent=True)
 
-    if not data:
-        return jsonify({
-            "error": "Invalid JSON format"
-        }), 400
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid JSON format"}), 400
 
     prompt_type = data.get("type")
     topic = data.get("topic")
 
-    if not prompt_type or not topic:
-        return jsonify({
-            "error": "Missing type or topic"
-        }), 400
+    if not isinstance(prompt_type, str) or not prompt_type.strip():
+        return jsonify({"error": "Missing type or topic"}), 400
+
+    if not isinstance(topic, str) or not topic.strip():
+        return jsonify({"error": "Missing type or topic"}), 400
 
     if hf_client is None:
         return jsonify({
             "error": "Hugging Face API key is not configured on the server."
         }), 500
 
-    prompt = f"Write a {prompt_type} email about {topic}."
+    prompt = (
+        f"Write a {prompt_type.strip()} email about {topic.strip()}. "
+        "Return only the email draft."
+    )
 
     try:
         response = hf_client.chat_completion(
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
+            messages=[{"role": "user", "content": prompt}],
             model="Qwen/Qwen2.5-72B-Instruct",
-            max_tokens=500
+            max_tokens=500,
         )
 
         return jsonify({
-            "email": response.choices[0].message.content
+            "email": response.choices[0].message.content or ""
         })
 
     except Exception:
@@ -574,48 +505,43 @@ def generate_mail():
 
         return jsonify({
             "error": (
-                "Email generation failed. Check the Vercel logs "
-                "and verify your Hugging Face API key and model access."
+                "Email generation failed. Verify the Hugging Face API key, "
+                "model availability, and Vercel logs."
             )
         }), 502
 
 
-# --------------------------------------------------
+# ==================================================
 # SPAM DETECTION
-# --------------------------------------------------
+# ==================================================
 
 @app.route("/detect_mail", methods=["POST"])
 def detect_mail():
     data = request.get_json(silent=True)
 
-    if not data:
-        return jsonify({
-            "error": "Invalid JSON format"
-        }), 400
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid JSON format"}), 400
 
     email_text = data.get("email_text", "")
 
     if not isinstance(email_text, str) or not email_text.strip():
-        return jsonify({
-            "error": "Email text is required"
-        }), 400
+        return jsonify({"error": "Email text is required"}), 400
 
     try:
         processed_text = preprocess_text(email_text)
         nlp_summary = get_nlp_summary(email_text)
 
-        vectorized_text = vectorizer.transform([
-            processed_text
-        ])
-
+        vectorized_text = vectorizer.transform([processed_text])
         prediction = model.predict(vectorized_text)[0]
 
-        # Preserves your original label mapping:
-        # 1 = Spam, 0 = Ham.
+        # This assumes the model uses 1 = Spam and 0 = Ham.
+        # Confirm these labels match the model's training labels.
         result = "Spam" if prediction == 1 else "Ham"
 
         feature_contributions = []
 
+        # Coefficient-based contributions for Logistic Regression.
+        # These are not SHAP values.
         try:
             feature_names = vectorizer.get_feature_names_out()
             coefficients = model.coef_[0]
@@ -665,15 +591,13 @@ def detect_mail():
         app.logger.exception("Email detection failed")
 
         return jsonify({
-            "error": (
-                "Email detection failed. Check the Vercel function logs."
-            )
+            "error": "Email detection failed. Check the Vercel function logs."
         }), 500
 
 
-# --------------------------------------------------
+# ==================================================
 # LOCAL DEVELOPMENT
-# --------------------------------------------------
+# ==================================================
 
 if __name__ == "__main__":
     app.run(debug=True)
