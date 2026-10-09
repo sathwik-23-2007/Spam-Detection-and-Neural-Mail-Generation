@@ -552,20 +552,19 @@ def generate_mail():
 
         return jsonify({"email": email.strip()}), 200
 
+  
     except Exception as exc:
-        # Log the exception type and traceback on the server.
-        # Never log the API token or send internal details to users.
         app.logger.exception(
-            "Hugging Face generation failed (%s)",
+            "HF_GENERATION_FAILURE type=%s error=%s",
             type(exc).__name__,
+            str(exc)[:1000],
         )
 
         return jsonify({
-            "error": (
-                "Email generation failed. Check the server logs "
-                "for the underlying provider error."
-            )
-        }), 502
+            "error": "Email generation failed.",
+            "error_type": type(exc).__name__,
+            "details": str(exc)[:500],
+        }), 502, 502
 
 
 # ==================================================
